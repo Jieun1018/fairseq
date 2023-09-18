@@ -401,6 +401,7 @@ class Wav2Vec2Model(BaseFairseqModel):
             torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
         )
         encoder_cls = TransformerEncoder
+        #encoder_cls = TransformerEncoderAdapter
         if cfg.layer_type == "conformer" and cfg.pos_enc_type in ["rel_pos", "rope"]:
             encoder_cls = ConformerEncoder
 
@@ -470,7 +471,8 @@ class Wav2Vec2Model(BaseFairseqModel):
                     mask_dropout=self.cfg.mask_dropout,
                 )
                 mask_indices = torch.from_numpy(mask_indices).to(x.device)
-            x = index_put(x, mask_indices, self.mask_emb)
+            #x = index_put(x, mask_indices, self.mask_emb)
+            x = index_put(x, mask_indices, 0)
         else:
             mask_indices = None
 
@@ -941,6 +943,48 @@ def make_conv_pos(e, k, g):
     return pos_conv
 
 
+class ResidualAdapterModule(nn.Module):
+    """
+    Implements a residual adapter based on https://arxiv.org/pdf/1909.08478.pdf
+    modules similar to the original residual adapter except layernorm location (first -> last)
+    """
+    def __init__(
+        self,
+        embedding_dim: float = 1024,
+        layer_num: int = 24,
+        proj_dim: float = 512,
+    ) -> None:
+        
+        super().__init__()
+
+        self.type = 'linear'
+        
+        def build_adapter(embedding_dim, proj_dim, type_=self.type):
+            if type_ == 'conv':
+                return ConvolutionModule(768, 31)
+            else:
+                return nn.Sequential(
+                    #nn.LayerNorm(embedding_dim),
+                    nn.Linear(embedding_dim, proj_dim),
+                    nn.ReLU(),
+                    nn.Linear(proj_dim, embedding_dim),
+                    nn.LayerNorm(embedding_dim),
+                )
+
+        self.adapter_layers = nn.ModuleList(
+            [build_adapter(embedding_dim, proj_dim, type_=self.type) for _ in range(layer_num)]
+        )
+    
+    def forward(self, x, layer_id=-1):
+        x = x.transpose(0, 1)
+        residual = x
+        x = self.adapter_layers[layer_id](x)
+        x = residual + x
+        x = x.transpose(0, 1)
+
+        return x
+
+
 class TransformerEncoder(nn.Module):
     def build_encoder_layer(self, args: Wav2Vec2Config, **kwargs):
         if args.layer_type == "transformer":
@@ -1162,6 +1206,103 @@ class TransformerEncoder(nn.Module):
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
         return state_dict
+
+
+class TransformerEncoderAdapter(TransformerEncoder):
+    def __init__(self, args: Wav2Vec2Config):
+        super().__init__(args)
+        self.adapters = ResidualAdapterModule(proj_dim=512)
+        #self.adapters = ResidualAdapterModule(proj_dim=16)
+
+        for p in self.adapters.parameters():
+            p.data /= 10.
+        #p.data = nn.Parameter(torch.zeros(p.size()).to('cuda'))
+        #p.data = nn.Parameter(torch.randn(p.size()).to('cuda')/20.)
+
+    def forward(self, x, padding_mask=None, layer=None, tgt_layer=None, **kwargs,):
+        x, layer_results = self.extract_features_with_adapter(
+                                x, 
+                                padding_mask=padding_mask, 
+                                tgt_layer=tgt_layer
+                            )
+
+        if self.layer_norm_first and layer is None:
+            x = self.layer_norm(x)
+     
+        return x, layer_results
+
+    def extract_features_with_adapter(
+        self,
+        x,   
+        padding_mask=None,
+        tgt_layer=None,
+        min_layer=0,
+    ):   
+
+        if padding_mask is not None:
+            x = index_put(x, padding_mask, 0)
+
+        x_conv = self.pos_conv(x.transpose(1, 2))
+        x_conv = x_conv.transpose(1, 2)
+        x = x + x_conv
+
+        if not self.layer_norm_first:
+            x = self.layer_norm(x)
+
+        # pad to the sequence length dimension
+        x, pad_length = pad_to_multiple(
+            x, self.required_seq_len_multiple, dim=-2, value=0
+        )    
+        if pad_length > 0 and padding_mask is None:
+            padding_mask = x.new_zeros((x.size(0), x.size(1)), dtype=torch.bool)
+            padding_mask[:, -pad_length:] = True 
+        else:
+            padding_mask, _ = pad_to_multiple(
+                padding_mask, self.required_seq_len_multiple, dim=-1, value=True
+            )    
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        layer_results = []
+        r = None
+
+        for i, layer in enumerate(self.layers):
+            dropout_probability = np.random.random() if self.layerdrop > 0 else 1
+            if not self.training or (dropout_probability > self.layerdrop):
+                x, (z, lr) = layer(
+                    x, self_attn_padding_mask=padding_mask, need_weights=False,
+                )
+                x = self.adapters(x, layer_id=i)
+
+                if i >= min_layer:
+                    layer_results.append((x, z, lr))
+
+            if i == tgt_layer:
+                r = x
+                break
+
+        if r is not None:
+            x = r
+
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+
+        # undo paddding
+        if pad_length > 0:
+            x = x[:, :-pad_length]
+
+            def undo_pad(a, b, c):
+                return (
+                    a[:-pad_length],
+                    b[:-pad_length] if b is not None else b,
+                    c[:-pad_length],
+                )
+
+            layer_results = [undo_pad(*u) for u in layer_results]
+
+        return x, layer_results
 
 
 class ConformerEncoder(TransformerEncoder):

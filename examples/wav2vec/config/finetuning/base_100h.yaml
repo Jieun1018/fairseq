@@ -12,18 +12,22 @@ checkpoint:
 task:
   _name: audio_finetuning
   data: ???
-  normalize: false
+  normalize: true
+  #normalize: false
   labels: ltr
 
 dataset:
   num_workers: 6
   max_tokens: 3200000
   skip_invalid_size_inputs_valid_test: true
-  valid_subset: dev_other
+  train_subset: train-clean-100
+  valid_subset: dev-other
+  #valid_subset: dev_other
 
 distributed_training:
   ddp_backend: legacy_ddp
-  distributed_world_size: 2
+  distributed_world_size: 4
+  #distributed_world_size: 2
 
 criterion:
   _name: ctc
@@ -33,7 +37,8 @@ optimization:
   max_update: 80000
   lr: [0.00003]
   sentence_avg: true
-  update_freq: [4]
+  update_freq: [2]
+  #update_freq: [4]
 
 optimizer:
   _name: adam
